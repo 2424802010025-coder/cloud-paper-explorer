@@ -1,0 +1,38 @@
+name = "cloud-paper-explorer"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+
+# 1. Phục vụ các file giao diện tĩnh từ thư mục ./public (do Kỹ sư 2 code)
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# 2. Kết nối Cơ sở dữ liệu D1 vừa tạo ở region APAC thông qua biến env.DB
+[[d1_databases]]
+binding = "DB"
+database_name = "paper_explorer_db"
+database_id = "b979fc68-c65d-41ec-ad75-d0083ce8c2ca"
+
+# 3. Kết nối dịch vụ trí tuệ nhân tạo Workers AI qua biến env.AI
+[ai]
+binding = "AI"
+
+# 4. Cấu hình Rate Limiting tại biên (Edge) cho tìm kiếm và phân tích AI
+[[ratelimits]]
+name = "SEARCH_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "AI_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 5, period = 60 }
+
+# 5. Khai báo các biến cấu hình hệ thống (Governance & FinOps)
+[vars]
+PROMPT_VERSION = "v1"
+PRIMARY_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+FALLBACK_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+DAILY_AI_BUDGET = "50"
+PER_IP_DAILY_AI_LIMIT = "5"
+AI_GATEWAY_ID = "paper-explorer-gw"
