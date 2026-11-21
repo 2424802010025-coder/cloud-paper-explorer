@@ -1,6 +1,6 @@
 /**
- * GIAI ĐOẠN 2 - KỸ SƯ 2: QUẢN LÝ CLIENT_ID, TÌM KIẾM PHÂN TRANG,
- * CHỐNG DOM/URI XSS & XỬ LÝ BÀI BÁO THIẾU ABSTRACT
+ * GIAI ĐOẠN 3 - KỸ SƯ 2: CLIENT_ID, TÌM KIẾM PHÂN TRANG, CHỐNG DOM/URI XSS,
+ * HIỂN THỊ TÔ MÀU ABSTRACT, LỌC NHÃN CÂU & CẢNH BÁO AI_GENERATED
  */
 
 let currentPapers = [];
@@ -182,7 +182,118 @@ async function executeSearch(page = 1) {
   }
 }
 
-// Hiển thị chi tiết bài báo với safeExternalUrl và kiểm tra khóa nút AI khi thiếu Abstract
+// Vẽ kết quả phân tích AI: tô màu câu theo nhãn, lọc nhãn và gắn cờ ai_generated
+function renderAnalysisResult(aiData, activeFilter = "all") {
+  const abstractBox = document.getElementById("abstract-box");
+  const outBox = document.getElementById("ai-output-box");
+
+  // 1. Vẽ các câu trong Abstract với màu sắc tương ứng nhãn
+  const sentencesHtml = (aiData.sentences || [])
+    .map((s) => {
+      const dimmed = activeFilter !== "all" && s.label !== activeFilter ? "opacity: 0.25;" : "";
+      return `<span class="hl-${escapeHtml(s.label)}" style="${dimmed}" title="Câu #${s.index} • Nhãn: ${escapeHtml(s.label)}">${escapeHtml(s.text)}</span>`;
+    })
+    .join(" ");
+
+  abstractBox.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+      <strong>Abstract đã phân tách ngữ nghĩa (${(aiData.sentences || []).length} câu):</strong>
+      <small>Bấm vào nhãn bên dưới để lọc nhanh</small>
+    </div>
+    <div class="ai-legend">
+      <button type="button" class="legend-item ${activeFilter === "all" ? "active" : ""}" data-filter="all">Tất cả</button>
+      <button type="button" class="legend-item hl-background ${activeFilter === "background" ? "active" : ""}" data-filter="background">🔵 Bối cảnh (Background)</button>
+      <button type="button" class="legend-item hl-method ${activeFilter === "method" ? "active" : ""}" data-filter="method">🟢 Phương pháp (Method)</button>
+      <button type="button" class="legend-item hl-result ${activeFilter === "result" ? "active" : ""}" data-filter="result">🟡 Kết quả (Result)</button>
+    </div>
+    <p style="margin-top: 0.5rem; line-height: 1.9;">${sentencesHtml}</p>
+  `;
+
+  // Gắn sự kiện bấm lọc theo từng loại câu
+  abstractBox.querySelectorAll(".legend-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      renderAnalysisResult(aiData, btn.dataset.filter);
+    });
+  });
+
+  // 2. Vẽ khung tóm tắt tiếng Việt và gợi ý đề tài kèm cờ cảnh báo ai_generated
+  const fallbackNote = aiData.fallback_triggered
+    ? `<span style="color:#b91c1c; font-weight:600;">(Đã kích hoạt Fallback Model)</span>`
+    : "";
+
+  const ideasHtml = (aiData.ideas || [])
+    .map((idea) => `<div class="idea-chip">🟣 <strong>Gợi ý đề tài:</strong> ${escapeHtml(idea)}</div>`)
+    .join("");
+
+  outBox.innerHTML = `
+    <div class="ai-summary-card">
+      <div class="ai-warning-banner">
+        <span>⚠️ <strong>Cờ đánh dấu (ai_generated = true):</strong> Nội dung tóm tắt tiếng Việt và gợi ý đề tài do AI sinh ra, cần kiểm chứng với văn bản gốc.</span>
+        <span>Model: <code>${escapeHtml(aiData.model || "Workers AI")}</code> ${fallbackNote} • Prompt: <code>${escapeHtml(aiData.prompt_version || "v1")}</code></span>
+      </div>
+      <h4 style="margin-bottom: 0.5rem;">🇻🇳 Tóm tắt cấu trúc bằng tiếng Việt</h4>
+      <p style="margin-bottom: 0.35rem;">🔵 <strong>Bối cảnh:</strong> ${escapeHtml(aiData.vi_summary?.background || "")}</p>
+      <p style="margin-bottom: 0.35rem;">🟢 <strong>Phương pháp:</strong> ${escapeHtml(aiData.vi_summary?.method || "")}</p>
+      <p style="margin-bottom: 0.5rem;">🟡 <strong>Kết quả:</strong> ${escapeHtml(aiData.vi_summary?.result || "")}</p>
+      ${ideasHtml}
+    </div>
+  `;
+}
+
+// Tự động kiểm tra Cache phân tích (GET) khi mở chi tiết bài báo
+async function checkExistingAnalysis(paperId) {
+  try {
+    const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/analysis`, {
+      method: "GET",
+      headers: { "X-Client-Id": CLIENT_ID },
+    });
+    if (response.ok) {
+      const cachedAiData = await response.json();
+      renderAnalysisResult(cachedAiData);
+      const btn = document.getElementById("btn-run-ai");
+      if (btn) {
+        btn.textContent = "✅ Đã tải phân tích từ D1 Cache";
+        btn.disabled = true;
+      }
+    }
+  } catch (_) {
+    // Nếu 404 (chưa có trong cache) thì giữ nguyên nút để người dùng chủ động bấm
+  }
+}
+
+// Gọi POST /api/papers/:id/analysis khi người dùng chủ động bấm nút phân tích AI
+async function runAiAnalysis(paper) {
+  const btn = document.getElementById("btn-run-ai");
+  const outBox = document.getElementById("ai-output-box");
+  if (!btn || !outBox) return;
+
+  btn.disabled = true;
+  btn.textContent = "⏳ Đang phân tích bằng Workers AI...";
+  outBox.innerHTML = `<p style="color:#475569;">⏳ Đang gửi Abstract tới Cloudflare Workers AI, vui lòng chờ vài giây...</p>`;
+
+  try {
+    const aiData = await apiFetch(`/api/papers/${encodeURIComponent(paper.paper_id)}/analysis`, {
+      method: "POST",
+      body: JSON.stringify({
+        title: paper.title,
+        abstract: paper.abstract,
+      }),
+    });
+    renderAnalysisResult(aiData);
+    btn.textContent = "✅ Đã hoàn tất phân tích AI";
+    loadFinOpsStats();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = "✨ Phân tích & Tô màu Abstract bằng Workers AI";
+    outBox.innerHTML = `
+      <div style="padding: 0.75rem; background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; border-radius: 6px;">
+        ❌ Không thể chạy phân tích AI: ${escapeHtml(err.message)}
+      </div>
+    `;
+  }
+}
+
+// Hiển thị chi tiết bài báo với safeExternalUrl, kiểm tra Cache AI và gắn nút chạy AI
 async function showPaperDetail(paperId) {
   const paper = currentPapers.find((p) => p.paper_id === paperId);
   if (!paper) return;
@@ -211,6 +322,14 @@ async function showPaperDetail(paperId) {
     </div>
     <div id="ai-output-box" style="margin-top: 1rem;"></div>
   `;
+
+  if (hasAbs) {
+    const runBtn = document.getElementById("btn-run-ai");
+    if (runBtn) {
+      runBtn.addEventListener("click", () => runAiAnalysis(paper));
+    }
+    checkExistingAnalysis(paper.paper_id);
+  }
 }
 
 // Gắn sự kiện form tìm kiếm về Trang 1 và chạy mặc định khi mở trang

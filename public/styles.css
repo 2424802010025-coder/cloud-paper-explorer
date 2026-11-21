@@ -239,3 +239,66 @@ body {
   padding: 0.1rem 0.45rem;
   border-radius: 4px;
 }
+/* Thanh chú giải màu (Legend) có thể bấm để lọc nhãn câu */
+.ai-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+  padding: 0.6rem;
+  background: #f1f5f9;
+  border-radius: 6px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.legend-item.active {
+  border-color: #0f172a;
+}
+
+/* Hộp tóm tắt tiếng Việt và gợi ý đề tài có gắn cờ ai_generated */
+.ai-summary-card {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: #f8fafc;
+  border-left: 4px solid #0284c7;
+  border-radius: 6px;
+  border-top: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-warning-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  color: #92400e;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  margin-bottom: 0.75rem;
+}
+
+.idea-chip {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  background: #f3e8ff;
+  color: #581c87;
+  border-radius: 6px;
+  font-size: 0.86rem;
+  border: 1px solid #d8b4fe;
+}
