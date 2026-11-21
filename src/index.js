@@ -1,8 +1,9 @@
 /**
- * GIAI ĐOẠN 2 - KỸ SƯ 1: TÍCH HỢP TÌM KIẾM OPENALEX THẬT, CACHE PHÂN TẦNG D1 & SERVER-TIMING
+ * GIAI ĐOẠN 3 - KỸ SƯ 1: TÌM KIẾM OPENALEX + CACHE D1 + WORKERS AI JSON MODE QUA AI GATEWAY
  */
 import { searchOpenAlex, normalizeOpenAlexWork } from "./openalex.js";
 import { upsertPapersBatch, formatPaperRow, recordDailyUsage, getTodayKey } from "./db_service.js";
+import { isValidPaperId, analyzePaperWithFallback } from "./ai_service.js";
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -19,7 +20,7 @@ function errorResponse(code, message, status = 400, extraHeaders = {}) {
   return jsonResponse({ error: { code, message } }, status, extraHeaders);
 }
 
-// Xử lý tìm kiếm bài báo thật kết hợp Cache phân tầng TTL trong D1
+// 1. Xử lý tìm kiếm bài báo thật kết hợp Cache phân tầng TTL trong D1
 async function handleSearchRequest(url, env, ctx) {
   const q = (url.searchParams.get("q") || "").trim().replace(/\s+/g, " ").toLowerCase();
   const fromYear = url.searchParams.get("from") || "2020";
@@ -31,7 +32,6 @@ async function handleSearchRequest(url, env, ctx) {
   const cacheKey = `q=${q}|from=${fromYear}|to=${toYear}|cites=${minCites}|sort=${sort}|p=${page}`;
   const nowSec = Math.floor(Date.now() / 1000);
 
-  // 1. Tra cứu bảng search_cache trong D1 trước
   const tCacheStart = performance.now();
   const cached = await env.DB.prepare(
     "SELECT paper_ids, total, created_at, ttl_sec FROM search_cache WHERE cache_key = ?1"
@@ -53,7 +53,6 @@ async function handleSearchRequest(url, env, ctx) {
         .all();
       d1PapersReadMs = (performance.now() - tPapers).toFixed(2);
 
-      // Giữ nguyên đúng thứ tự sắp xếp như lúc OpenAlex trả về
       const mapById = new Map((rows.results || []).map((r) => [r.paper_id, formatPaperRow(r)]));
       items = paperIds.map((id) => mapById.get(id)).filter(Boolean);
     }
@@ -61,50 +60,30 @@ async function handleSearchRequest(url, env, ctx) {
     ctx.waitUntil(recordDailyUsage(env.DB, { hits: 1, rowsRead: paperIds.length + 1 }));
 
     return {
-      payload: {
-        query: q,
-        page,
-        total: cached.total,
-        cache_status: "HIT",
-        ttl_sec: cached.ttl_sec,
-        items,
-      },
+      payload: { query: q, page, total: cached.total, cache_status: "HIT", ttl_sec: cached.ttl_sec, items },
       serverTiming: `d1_cache;dur=${d1CacheReadMs}, d1_papers;dur=${d1PapersReadMs}`,
     };
   }
 
-  // 2. Cache MISS -> Gọi OpenAlex API thật
   const tOaStart = performance.now();
-  const oaData = await searchOpenAlex({
-    q,
-    fromYear,
-    toYear,
-    minCites,
-    sort,
-    page,
-    apiKey: env.OPENALEX_API_KEY,
-  });
+  const oaData = await searchOpenAlex({ q, fromYear, toYear, minCites, sort, page, apiKey: env.OPENALEX_API_KEY });
   const oaFetchMs = (performance.now() - tOaStart).toFixed(2);
 
   const normalized = (oaData.results || []).map(normalizeOpenAlexWork);
   const paperIds = normalized.map((p) => p.paper_id);
   const total = oaData.meta?.count || normalized.length;
 
-  // 3. TTL phân tầng: khoảng năm quá khứ (< 2026) lưu 7 ngày; chứa năm hiện tại lưu 6 giờ
   const currentYear = new Date().getUTCFullYear();
   const ttlSec = Number(toYear) < currentYear ? 7 * 86400 : 6 * 3600;
 
-  // 4. Lưu hàng loạt bài báo (DB.batch UPSERT) và lưu search_cache vào D1
   const tWriteStart = performance.now();
   const { rowsRead, rowsWritten } = await upsertPapersBatch(env.DB, normalized);
   const cacheWriteRes = await env.DB.prepare(
     `INSERT INTO search_cache (cache_key, paper_ids, total, created_at, ttl_sec)
      VALUES (?1, ?2, ?3, ?4, ?5)
      ON CONFLICT(cache_key) DO UPDATE SET
-       paper_ids = excluded.paper_ids,
-       total = excluded.total,
-       created_at = excluded.created_at,
-       ttl_sec = excluded.ttl_sec`
+       paper_ids = excluded.paper_ids, total = excluded.total,
+       created_at = excluded.created_at, ttl_sec = excluded.ttl_sec`
   )
     .bind(cacheKey, JSON.stringify(paperIds), total, nowSec, ttlSec)
     .run();
@@ -119,18 +98,104 @@ async function handleSearchRequest(url, env, ctx) {
     })
   );
 
-  const items = normalized.map(formatPaperRow);
   return {
-    payload: {
-      query: q,
-      page,
-      total,
-      cache_status: "MISS",
-      ttl_sec: ttlSec,
-      items,
-    },
+    payload: { query: q, page, total, cache_status: "MISS", ttl_sec: ttlSec, items: normalized.map(formatPaperRow) },
     serverTiming: `d1_cache;dur=${d1CacheReadMs}, oa_fetch;dur=${oaFetchMs}, d1_write;dur=${d1WriteMs}`,
   };
+}
+
+// 2. Xử lý Phân tích AI thật (GET chỉ đọc Cache, POST chạy Workers AI qua AI Gateway + Lưu D1)
+async function handleAnalysisRequest(paperId, method, env, ctx) {
+  if (!isValidPaperId(paperId)) {
+    return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ (phải có dạng W kèm chữ số).", 400);
+  }
+
+  const promptVersion = env.PROMPT_VERSION || "v1";
+  const tRead = performance.now();
+  const existing = await env.DB.prepare(
+    "SELECT model, result_json, neurons_used, created_at FROM analyses WHERE paper_id = ?1 AND prompt_version = ?2"
+  )
+    .bind(paperId, promptVersion)
+    .first();
+  const d1ReadMs = (performance.now() - tRead).toFixed(2);
+
+  if (existing) {
+    const parsed = JSON.parse(existing.result_json);
+    ctx.waitUntil(recordDailyUsage(env.DB, { hits: 1, rowsRead: 1 }));
+    return jsonResponse(
+      {
+        paper_id: paperId,
+        prompt_version: promptVersion,
+        model: existing.model,
+        cache_status: "HIT",
+        ai_generated: true,
+        disclaimer: "Nội dung tóm tắt và gợi ý đề tài do AI sinh tự động, cần đối chiếu văn bản gốc.",
+        ...parsed,
+      },
+      200,
+      { "Server-Timing": `d1_analysis_cache;dur=${d1ReadMs}` }
+    );
+  }
+
+  // Nếu là GET mà chưa có trong Cache -> trả 404 (không tự chạy AI)
+  if (method === "GET") {
+    return errorResponse("analysis_not_found", "Bài báo này chưa có bản phân tích AI trong Cache.", 404);
+  }
+
+  // Đọc bài báo từ D1 (chỉ dùng abstract trong D1, không nhận text tự do từ Client)
+  const paper = await env.DB.prepare("SELECT paper_id, title, abstract FROM papers WHERE paper_id = ?1")
+    .bind(paperId)
+    .first();
+
+  if (!paper) {
+    return errorResponse("paper_not_found", `Không tìm thấy bài báo ${paperId} trong D1. Hãy tìm kiếm bài báo trước.`, 404);
+  }
+  if (!paper.abstract || paper.abstract.trim().length < 20) {
+    return errorResponse("abstract_empty", "Bài báo này không có nội dung Abstract để phân tích.", 422);
+  }
+
+  const tAiStart = performance.now();
+  let aiOut;
+  try {
+    aiOut = await analyzePaperWithFallback(env, paper);
+  } catch (err) {
+    return errorResponse(err.code || "ai_bad_output", `Phân tích AI thất bại: ${err.detail || err.message}`, 502);
+  }
+  const aiInferMs = (performance.now() - tAiStart).toFixed(2);
+
+  // Chỉ lưu vào bảng analyses khi đầu ra JSON hoàn toàn hợp lệ
+  const tWrite = performance.now();
+  const nowSec = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO analyses (paper_id, prompt_version, model, result_json, neurons_used, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+     ON CONFLICT(paper_id, prompt_version) DO UPDATE SET
+       model = excluded.model, result_json = excluded.result_json,
+       neurons_used = excluded.neurons_used, created_at = excluded.created_at`
+  )
+    .bind(paperId, promptVersion, aiOut.model, JSON.stringify(aiOut.result), aiOut.neurons_used, nowSec)
+    .run();
+  const d1WriteMs = (performance.now() - tWrite).toFixed(2);
+
+  ctx.waitUntil(
+    recordDailyUsage(env.DB, { aiCalls: 1, misses: 1, rowsRead: 2, rowsWritten: 1 })
+  );
+
+  return jsonResponse(
+    {
+      paper_id: paperId,
+      prompt_version: promptVersion,
+      model: aiOut.model,
+      fallback_triggered: aiOut.fallback_triggered,
+      neurons_used: aiOut.neurons_used,
+      cache_status: "MISS",
+      ai_generated: true,
+      disclaimer: "Nội dung tóm tắt và gợi ý đề tài do AI sinh tự động, cần đối chiếu văn bản gốc.",
+      ...aiOut.result,
+    },
+    200,
+    { "Server-Timing": `d1_read;dur=${d1ReadMs}, ai_infer;dur=${aiInferMs}, d1_write;dur=${d1WriteMs}` }
+  );
 }
 
 export default {
@@ -139,20 +204,16 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // 1. Đường dẫn không phải /api/* -> trả file giao diện tĩnh trong ./public
     if (!path.startsWith("/api/")) {
       return env.ASSETS.fetch(request);
     }
 
     try {
-      // 2. Kiểm tra sức khỏe hệ thống
       if (path === "/api/health" && method === "GET") {
         const t0 = performance.now();
         const dbCheck = await env.DB.prepare(
           "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type='table'"
         ).first();
-        const d1Dur = (performance.now() - t0).toFixed(2);
-
         return jsonResponse(
           {
             status: "ok",
@@ -162,58 +223,33 @@ export default {
             prompt_version: env.PROMPT_VERSION,
           },
           200,
-          { "Server-Timing": `d1_health;dur=${d1Dur}` }
+          { "Server-Timing": `d1_health;dur=${(performance.now() - t0).toFixed(2)}` }
         );
       }
 
-      // 3. Tìm kiếm thật qua OpenAlex + D1 Cache: GET /api/search
       if (path === "/api/search" && method === "GET") {
         const { payload, serverTiming } = await handleSearchRequest(url, env, ctx);
         return jsonResponse(payload, 200, { "Server-Timing": serverTiming });
       }
 
-      // 4. Đọc chi tiết 1 bài báo từ D1: GET /api/papers/:id
       const paperDetailMatch = path.match(/^\/api\/papers\/([^/]+)$/);
       if (paperDetailMatch && method === "GET") {
         const paperId = paperDetailMatch[1];
-        const row = await env.DB.prepare("SELECT * FROM papers WHERE paper_id = ?1")
-          .bind(paperId)
-          .first();
+        if (!isValidPaperId(paperId)) {
+          return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ.", 400);
+        }
+        const row = await env.DB.prepare("SELECT * FROM papers WHERE paper_id = ?1").bind(paperId).first();
         if (!row) {
           return errorResponse("paper_not_found", `Không tìm thấy bài báo ${paperId} trong CSDL`, 404);
         }
         return jsonResponse(formatPaperRow(row));
       }
 
-      // 5. Mock API Contract tạm thời cho Phân tích AI (sẽ thay bằng AI thật ở Giai đoạn 3)
       const analysisMatch = path.match(/^\/api\/papers\/([^/]+)\/analysis$/);
       if (analysisMatch && (method === "GET" || method === "POST")) {
-        const paperId = analysisMatch[1];
-        return jsonResponse(
-          {
-            paper_id: paperId,
-            prompt_version: env.PROMPT_VERSION,
-            model: env.PRIMARY_AI_MODEL,
-            ai_generated: true,
-            disclaimer: "Nội dung tóm tắt và gợi ý đề tài do AI sinh tự động, cần đối chiếu văn bản gốc.",
-            sentences: [
-              { index: 0, text: "Serverless computing has emerged as a new cloud execution model.", label: "background" },
-              { index: 1, text: "We propose an analytical latency model for edge isolates.", label: "method" },
-              { index: 2, text: "Experimental results demonstrate a 68% reduction in cold start overhead.", label: "result" },
-            ],
-            vi_summary: {
-              background: "Điện toán không máy chủ (Serverless) đang trở thành mô hình thực thi đám mây thế hệ mới.",
-              method: "Nhóm tác giả đề xuất mô hình toán học phân tích độ trễ cho các tiến trình cô lập tại biên.",
-              result: "Thực nghiệm cho thấy giảm 68% độ trễ khởi động lạnh so với kiến trúc Container.",
-            },
-            ideas: ["Áp dụng mô hình cô lập V8 Isolate vào hệ thống tra cứu bài báo học thuật trên Cloudflare Edge."],
-          },
-          200,
-          { "Server-Timing": "mock_ai;dur=5.4" }
-        );
+        return await handleAnalysisRequest(analysisMatch[1], method, env, ctx);
       }
 
-      // 6. Thống kê thật từ bảng usage_daily: GET /api/stats
       if (path === "/api/stats" && method === "GET") {
         const day = getTodayKey();
         const dailyBudget = Number(env.DAILY_AI_BUDGET || 50);
