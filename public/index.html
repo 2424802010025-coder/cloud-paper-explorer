@@ -28,7 +28,7 @@
 
   <!-- 3. Khung nội dung chính -->
   <main class="main-layout">
-    <!-- Cột trái: Bộ lọc tìm kiếm & Danh sách kết quả -->
+    <!-- Cột trái (Tab 1): Bộ lọc tìm kiếm & Danh sách kết quả -->
     <section class="left-panel" id="search-tab">
       <form id="search-form" class="search-box">
         <input
@@ -57,10 +57,22 @@
       <div id="results-list" class="results-list"></div>
     </section>
 
-    <!-- Cột phải: Chi tiết bài báo, Phân tích AI & Đồ thị trích dẫn -->
+    <!-- Cột trái (Tab 2): Danh sách Bài báo đã lưu & Xuất hàng loạt BibTeX/IEEE -->
+    <section class="left-panel" id="bookmarks-tab" style="display: none;">
+      <div class="bookmark-toolbar">
+        <strong>🔖 Danh sách bài báo đã lưu</strong>
+        <div class="action-row">
+          <button type="button" id="btn-export-all-ieee" class="btn-outline">📋 Copy toàn bộ IEEE</button>
+          <button type="button" id="btn-export-all-bib" class="btn-primary">📥 Tải tất cả (.bib)</button>
+        </div>
+      </div>
+      <div id="bookmarks-list" class="results-list"></div>
+    </section>
+
+    <!-- Cột phải: Chi tiết bài báo, Phân tích AI, Trích dẫn & Đồ thị -->
     <aside class="right-panel" id="detail-panel">
       <div class="empty-state">
-        Chọn một bài báo ở danh sách bên trái để xem chi tiết, chạy Phân tích AI tô màu Abstract hoặc xuất trích dẫn BibTeX/IEEE.
+        Chọn một bài báo ở danh sách bên trái để xem chi tiết, chạy Phân tích AI tô màu Abstract, xem Đồ thị Trích dẫn hoặc xuất BibTeX/IEEE.
       </div>
     </aside>
   </main>

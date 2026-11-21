@@ -302,3 +302,63 @@ body {
   font-size: 0.86rem;
   border: 1px solid #d8b4fe;
 }
+/* Thanh công cụ Bookmark & hàng nút thao tác chi tiết */
+.bookmark-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  background: var(--surface);
+  padding: 0.85rem 1rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.note-box {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.note-box input {
+  flex: 1;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+/* Khung vẽ đồ thị trích dẫn Cytoscape.js */
+#cy-graph-container {
+  width: 100%;
+  height: 340px;
+  margin-top: 0.75rem;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+#graph-node-info {
+  margin-top: 0.5rem;
+  padding: 0.55rem 0.75rem;
+  background: #f1f5f9;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  color: #334155;
+  min-height: 2rem;
+}
+
+.copy-feedback {
+  font-size: 0.82rem;
+  color: #15803d;
+  font-weight: 600;
+}
