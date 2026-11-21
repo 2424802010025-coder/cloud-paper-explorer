@@ -2,15 +2,69 @@
 <html lang="vi">
 <head>
   <meta charset="UTF-8" />
-  <title>CloudScholar — Ready</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CloudScholar — Hệ thống Tra cứu & Phân tích Bài báo Khoa học trên Cloudflare Edge</title>
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <h1>☁️ CloudScholar Edge Ready (Giai đoạn 1)</h1>
-  <p>Thư mục public/ đã sẵn sàng cho Kỹ sư 2 (Light224466) phát triển giao diện SPA.</p>
-  <ul>
-    <li><a href="/api/health">Kiểm tra kết nối D1 (/api/health)</a></li>
-    <li><a href="/api/search?q=serverless">Thử Mock API Tìm kiếm (/api/search)</a></li>
-    <li><a href="/api/stats">Thử Mock API Thống kê (/api/stats)</a></li>
-  </ul>
+  <!-- 1. Thanh Header & FinOps Cloud Status -->
+  <header class="top-header">
+    <div class="brand">
+      <h1>☁️ CloudScholar Edge</h1>
+      <span class="subtitle">OpenAlex + Cloudflare Workers + D1 + Workers AI</span>
+    </div>
+    <div class="finops-bar" id="finops-bar">
+      <span id="stat-cache">Cache Hit: --%</span>
+      <span id="stat-ai-budget">Ngân sách AI hôm nay: --/--</span>
+      <span id="stat-latency">Server-Timing: -- ms</span>
+    </div>
+  </header>
+
+  <!-- 2. Thanh điều hướng Tab chính -->
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="search-tab">🔍 Tìm kiếm Bài báo</button>
+    <button class="tab-btn" data-tab="bookmarks-tab">🔖 Bài báo đã lưu (<span id="bookmark-count">0</span>)</button>
+  </nav>
+
+  <!-- 3. Khung nội dung chính -->
+  <main class="main-layout">
+    <!-- Cột trái: Bộ lọc tìm kiếm & Danh sách kết quả -->
+    <section class="left-panel" id="search-tab">
+      <form id="search-form" class="search-box">
+        <input
+          type="text"
+          id="q-input"
+          placeholder="Nhập từ khóa nghiên cứu (VD: serverless computing, zero trust, ebpf)..."
+          value="serverless computing"
+          required
+        />
+        <div class="filter-row">
+          <label>Từ năm: <input type="number" id="from-year" value="2020" min="1990" max="2026" /></label>
+          <label>Đến năm: <input type="number" id="to-year" value="2026" min="1990" max="2026" /></label>
+          <label>Trích dẫn tối thiểu: <input type="number" id="min-cites" value="5" min="0" /></label>
+          <label>Sắp xếp:
+            <select id="sort-select">
+              <option value="relevance_score:desc">Độ liên quan</option>
+              <option value="cited_by_count:desc">Trích dẫn giảm dần</option>
+              <option value="publication_year:desc">Mới nhất</option>
+            </select>
+          </label>
+          <button type="submit" class="btn-primary">Tìm kiếm</button>
+        </div>
+      </form>
+
+      <div id="search-meta" class="search-meta">Sẵn sàng tra cứu trên OpenAlex & D1 Cache.</div>
+      <div id="results-list" class="results-list"></div>
+    </section>
+
+    <!-- Cột phải: Chi tiết bài báo, Phân tích AI & Đồ thị trích dẫn -->
+    <aside class="right-panel" id="detail-panel">
+      <div class="empty-state">
+        Chọn một bài báo ở danh sách bên trái để xem chi tiết, chạy Phân tích AI tô màu Abstract hoặc xuất trích dẫn BibTeX/IEEE.
+      </div>
+    </aside>
+  </main>
+
+  <script src="/app.js"></script>
 </body>
 </html>
