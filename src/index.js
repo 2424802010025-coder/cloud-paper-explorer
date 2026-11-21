@@ -1,6 +1,8 @@
 /**
- * GIAI ĐOẠN 1 - KỸ SƯ 1: BỘ ĐỊNH TUYẾN API & HỢP ĐỒNG DỮ LIỆU MẪU (API CONTRACT)
+ * GIAI ĐOẠN 2 - KỸ SƯ 1: TÍCH HỢP TÌM KIẾM OPENALEX THẬT, CACHE PHÂN TẦNG D1 & SERVER-TIMING
  */
+import { searchOpenAlex, normalizeOpenAlexWork } from "./openalex.js";
+import { upsertPapersBatch, formatPaperRow, recordDailyUsage, getTodayKey } from "./db_service.js";
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -17,6 +19,120 @@ function errorResponse(code, message, status = 400, extraHeaders = {}) {
   return jsonResponse({ error: { code, message } }, status, extraHeaders);
 }
 
+// Xử lý tìm kiếm bài báo thật kết hợp Cache phân tầng TTL trong D1
+async function handleSearchRequest(url, env, ctx) {
+  const q = (url.searchParams.get("q") || "").trim().replace(/\s+/g, " ").toLowerCase();
+  const fromYear = url.searchParams.get("from") || "2020";
+  const toYear = url.searchParams.get("to") || "2026";
+  const minCites = url.searchParams.get("min_cites") || "0";
+  const sort = url.searchParams.get("sort") || "relevance_score:desc";
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+
+  const cacheKey = `q=${q}|from=${fromYear}|to=${toYear}|cites=${minCites}|sort=${sort}|p=${page}`;
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // 1. Tra cứu bảng search_cache trong D1 trước
+  const tCacheStart = performance.now();
+  const cached = await env.DB.prepare(
+    "SELECT paper_ids, total, created_at, ttl_sec FROM search_cache WHERE cache_key = ?1"
+  )
+    .bind(cacheKey)
+    .first();
+  const d1CacheReadMs = (performance.now() - tCacheStart).toFixed(2);
+
+  if (cached && nowSec - cached.created_at < cached.ttl_sec) {
+    const paperIds = JSON.parse(cached.paper_ids || "[]");
+    let items = [];
+    let d1PapersReadMs = "0.00";
+
+    if (paperIds.length > 0) {
+      const tPapers = performance.now();
+      const placeholders = paperIds.map((_, i) => `?${i + 1}`).join(",");
+      const rows = await env.DB.prepare(`SELECT * FROM papers WHERE paper_id IN (${placeholders})`)
+        .bind(...paperIds)
+        .all();
+      d1PapersReadMs = (performance.now() - tPapers).toFixed(2);
+
+      // Giữ nguyên đúng thứ tự sắp xếp như lúc OpenAlex trả về
+      const mapById = new Map((rows.results || []).map((r) => [r.paper_id, formatPaperRow(r)]));
+      items = paperIds.map((id) => mapById.get(id)).filter(Boolean);
+    }
+
+    ctx.waitUntil(recordDailyUsage(env.DB, { hits: 1, rowsRead: paperIds.length + 1 }));
+
+    return {
+      payload: {
+        query: q,
+        page,
+        total: cached.total,
+        cache_status: "HIT",
+        ttl_sec: cached.ttl_sec,
+        items,
+      },
+      serverTiming: `d1_cache;dur=${d1CacheReadMs}, d1_papers;dur=${d1PapersReadMs}`,
+    };
+  }
+
+  // 2. Cache MISS -> Gọi OpenAlex API thật
+  const tOaStart = performance.now();
+  const oaData = await searchOpenAlex({
+    q,
+    fromYear,
+    toYear,
+    minCites,
+    sort,
+    page,
+    apiKey: env.OPENALEX_API_KEY,
+  });
+  const oaFetchMs = (performance.now() - tOaStart).toFixed(2);
+
+  const normalized = (oaData.results || []).map(normalizeOpenAlexWork);
+  const paperIds = normalized.map((p) => p.paper_id);
+  const total = oaData.meta?.count || normalized.length;
+
+  // 3. TTL phân tầng: khoảng năm quá khứ (< 2026) lưu 7 ngày; chứa năm hiện tại lưu 6 giờ
+  const currentYear = new Date().getUTCFullYear();
+  const ttlSec = Number(toYear) < currentYear ? 7 * 86400 : 6 * 3600;
+
+  // 4. Lưu hàng loạt bài báo (DB.batch UPSERT) và lưu search_cache vào D1
+  const tWriteStart = performance.now();
+  const { rowsRead, rowsWritten } = await upsertPapersBatch(env.DB, normalized);
+  const cacheWriteRes = await env.DB.prepare(
+    `INSERT INTO search_cache (cache_key, paper_ids, total, created_at, ttl_sec)
+     VALUES (?1, ?2, ?3, ?4, ?5)
+     ON CONFLICT(cache_key) DO UPDATE SET
+       paper_ids = excluded.paper_ids,
+       total = excluded.total,
+       created_at = excluded.created_at,
+       ttl_sec = excluded.ttl_sec`
+  )
+    .bind(cacheKey, JSON.stringify(paperIds), total, nowSec, ttlSec)
+    .run();
+  const d1WriteMs = (performance.now() - tWriteStart).toFixed(2);
+
+  ctx.waitUntil(
+    recordDailyUsage(env.DB, {
+      oaCalls: 1,
+      misses: 1,
+      rowsRead: rowsRead + 1,
+      rowsWritten: rowsWritten + (cacheWriteRes.meta?.rows_written || 1),
+    })
+  );
+
+  const items = normalized.map(formatPaperRow);
+  return {
+    payload: {
+      query: q,
+      page,
+      total,
+      cache_status: "MISS",
+      ttl_sec: ttlSec,
+      items,
+    },
+    serverTiming: `d1_cache;dur=${d1CacheReadMs}, oa_fetch;dur=${oaFetchMs}, d1_write;dur=${d1WriteMs}`,
+  };
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -29,7 +145,7 @@ export default {
     }
 
     try {
-      // 2. Kiểm tra sức khỏe Worker và kết nối thật tới Cloudflare D1
+      // 2. Kiểm tra sức khỏe hệ thống
       if (path === "/api/health" && method === "GET") {
         const t0 = performance.now();
         const dbCheck = await env.DB.prepare(
@@ -50,56 +166,26 @@ export default {
         );
       }
 
-      // 3. Mock API Contract: GET /api/search
+      // 3. Tìm kiếm thật qua OpenAlex + D1 Cache: GET /api/search
       if (path === "/api/search" && method === "GET") {
-        const q = url.searchParams.get("q") || "cloud computing";
-        return jsonResponse(
-          {
-            query: q,
-            page: Number(url.searchParams.get("page") || 1),
-            total: 2,
-            cache_status: "MOCK_CONTRACT",
-            items: [
-              {
-                paper_id: "W2741809807",
-                title: "Serverless Computing: Current Trends and Open Problems",
-                abstract:
-                  "Serverless computing has emerged as a new cloud execution model. We propose an analytical latency model for edge isolates. Experimental results demonstrate a 68% reduction in cold start overhead compared to container runtimes.",
-                year: 2025,
-                cited_by: 142,
-                doi: "https://doi.org/10.1109/CLOUD.2025.00012",
-                venue: "IEEE Transactions on Cloud Computing",
-                authors: ["Ioana Baldini", "Paul Castro", "Kerry Chang"],
-                freshness: {
-                  label: "Mới nổi",
-                  code: "emerging",
-                  cites_per_year: 71.0,
-                },
-              },
-              {
-                paper_id: "W3124567890",
-                title: "Edge Database Replication Strategies on Distributed SQLite",
-                abstract:
-                  "Global edge applications suffer from database read latency when storage is centralized. We introduce a two-tier caching protocol combining edge SQLite and gateway memory. Evaluation across 5 regions shows 4.2x throughput improvement.",
-                year: 2021,
-                cited_by: 310,
-                doi: "https://doi.org/10.1145/3447548.3467001",
-                venue: "ACM SIGMOD International Conference",
-                authors: ["Michael Stonebraker", "Andy Pavlo"],
-                freshness: {
-                  label: "Nền tảng",
-                  code: "foundational",
-                  cites_per_year: 51.6,
-                },
-              },
-            ],
-          },
-          200,
-          { "Server-Timing": "mock_search;dur=1.2" }
-        );
+        const { payload, serverTiming } = await handleSearchRequest(url, env, ctx);
+        return jsonResponse(payload, 200, { "Server-Timing": serverTiming });
       }
 
-      // 4. Mock API Contract: GET/POST /api/papers/:id/analysis
+      // 4. Đọc chi tiết 1 bài báo từ D1: GET /api/papers/:id
+      const paperDetailMatch = path.match(/^\/api\/papers\/([^/]+)$/);
+      if (paperDetailMatch && method === "GET") {
+        const paperId = paperDetailMatch[1];
+        const row = await env.DB.prepare("SELECT * FROM papers WHERE paper_id = ?1")
+          .bind(paperId)
+          .first();
+        if (!row) {
+          return errorResponse("paper_not_found", `Không tìm thấy bài báo ${paperId} trong CSDL`, 404);
+        }
+        return jsonResponse(formatPaperRow(row));
+      }
+
+      // 5. Mock API Contract tạm thời cho Phân tích AI (sẽ thay bằng AI thật ở Giai đoạn 3)
       const analysisMatch = path.match(/^\/api\/papers\/([^/]+)\/analysis$/);
       if (analysisMatch && (method === "GET" || method === "POST")) {
         const paperId = analysisMatch[1];
@@ -111,49 +197,46 @@ export default {
             ai_generated: true,
             disclaimer: "Nội dung tóm tắt và gợi ý đề tài do AI sinh tự động, cần đối chiếu văn bản gốc.",
             sentences: [
-              {
-                index: 0,
-                text: "Serverless computing has emerged as a new cloud execution model.",
-                label: "background",
-              },
-              {
-                index: 1,
-                text: "We propose an analytical latency model for edge isolates.",
-                label: "method",
-              },
-              {
-                index: 2,
-                text: "Experimental results demonstrate a 68% reduction in cold start overhead compared to container runtimes.",
-                label: "result",
-              },
+              { index: 0, text: "Serverless computing has emerged as a new cloud execution model.", label: "background" },
+              { index: 1, text: "We propose an analytical latency model for edge isolates.", label: "method" },
+              { index: 2, text: "Experimental results demonstrate a 68% reduction in cold start overhead.", label: "result" },
             ],
             vi_summary: {
               background: "Điện toán không máy chủ (Serverless) đang trở thành mô hình thực thi đám mây thế hệ mới.",
-              method: "Nhóm tác giả đề xuất mô hình toán học phân tích độ trễ cho các tiến trình cô lập (Isolate) tại biên.",
-              result: "Thực nghiệm cho thấy giảm 68% độ trễ khởi động lạnh (Cold Start) so với kiến trúc Container.",
+              method: "Nhóm tác giả đề xuất mô hình toán học phân tích độ trễ cho các tiến trình cô lập tại biên.",
+              result: "Thực nghiệm cho thấy giảm 68% độ trễ khởi động lạnh so với kiến trúc Container.",
             },
-            ideas: [
-              "Áp dụng mô hình cô lập V8 Isolate vào hệ thống tra cứu bài báo học thuật trên hạ tầng Cloudflare Edge.",
-            ],
+            ideas: ["Áp dụng mô hình cô lập V8 Isolate vào hệ thống tra cứu bài báo học thuật trên Cloudflare Edge."],
           },
           200,
           { "Server-Timing": "mock_ai;dur=5.4" }
         );
       }
 
-      // 5. Mock API Contract: GET /api/stats
+      // 6. Thống kê thật từ bảng usage_daily: GET /api/stats
       if (path === "/api/stats" && method === "GET") {
+        const day = getTodayKey();
+        const dailyBudget = Number(env.DAILY_AI_BUDGET || 50);
+        const u = (await env.DB.prepare("SELECT * FROM usage_daily WHERE day = ?1").bind(day).first()) || {
+          ai_calls: 0,
+          oa_calls: 0,
+          cache_hits: 0,
+          cache_misses: 0,
+          d1_rows_read: 0,
+          d1_rows_written: 0,
+        };
+        const totalReqs = (u.cache_hits || 0) + (u.cache_misses || 0);
         return jsonResponse({
-          day: new Date().toISOString().slice(0, 10),
-          ai_calls_today: 3,
-          daily_ai_budget: Number(env.DAILY_AI_BUDGET || 50),
-          ai_budget_remaining: Number(env.DAILY_AI_BUDGET || 50) - 3,
-          oa_calls_today: 12,
-          cache_hits: 45,
-          cache_misses: 12,
-          cache_hit_ratio: 0.789,
-          d1_rows_read: 230,
-          d1_rows_written: 38,
+          day,
+          ai_calls_today: u.ai_calls || 0,
+          daily_ai_budget: dailyBudget,
+          ai_budget_remaining: Math.max(0, dailyBudget - (u.ai_calls || 0)),
+          oa_calls_today: u.oa_calls || 0,
+          cache_hits: u.cache_hits || 0,
+          cache_misses: u.cache_misses || 0,
+          cache_hit_ratio: totalReqs > 0 ? Number(((u.cache_hits || 0) / totalReqs).toFixed(3)) : 0,
+          d1_rows_read: u.d1_rows_read || 0,
+          d1_rows_written: u.d1_rows_written || 0,
         });
       }
 
