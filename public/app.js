@@ -62,8 +62,10 @@ async function apiFetch(endpoint, options = {}) {
   }
 
   const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data?.error?.message || `Lỗi HTTP ${response.status}`);
+if (!response.ok) {
+    const err = new Error(data?.error?.message || `Lỗi HTTP ${response.status}`);
+    err.status = response.status;
+    throw err;
   }
   return data;
 }
@@ -351,14 +353,23 @@ async function runAiAnalysis(paper) {
     renderAnalysisResult(aiData);
     btn.textContent = "✅ Đã hoàn tất phân tích AI";
     loadFinOpsStats();
-  } catch (err) {
+ } catch (err) {
     btn.disabled = false;
     btn.textContent = "✨ Phân tích & Tô màu Abstract";
-    outBox.innerHTML = `
-      <div style="padding: 0.75rem; background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; border-radius: 6px;">
-        ❌ Không thể chạy phân tích AI: ${escapeHtml(err.message)}
-      </div>
-    `;
+    if (err.status === 429) {
+      outBox.innerHTML = `
+        <div style="padding: 0.85rem; background: #fff7ed; border: 1px solid #fdba74; color: #9a3412; border-radius: 6px;">
+          ⚠️ <strong>Đã chạm giới hạn bảo vệ ngân sách Đám mây (HTTP 429):</strong> ${escapeHtml(err.message)}<br/>
+          <small>Cơ chế chống lạm dụng (Rate Limit / Free Tier Guard) đang hoạt động để bảo vệ hạn mức Workers AI. Các chức năng tra cứu, đọc Cache D1, Bookmark và xuất BibTeX/IEEE vẫn hoạt động bình thường.</small>
+        </div>
+      `;
+    } else {
+      outBox.innerHTML = `
+        <div style="padding: 0.75rem; background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; border-radius: 6px;">
+          ❌ Không thể chạy phân tích AI: ${escapeHtml(err.message)}
+        </div>
+      `;
+    }
   }
 }
 
@@ -643,3 +654,78 @@ if (exportIeeeButton) {
 
 refreshBookmarks();
 executeSearch(1);
+// ==================== 9. SỔ CÁI TÀI NGUYÊN ĐÁM MÂY (FINOPS LEDGER) ====================
+
+async function renderFinOpsDashboardModal() {
+  const detailEl = document.getElementById("detail-panel");
+  detailEl.innerHTML = "<p>⏳ Đang tải sổ cái tài nguyên đám mây (Cloud FinOps Ledger)...</p>";
+
+  try {
+    const s = await apiFetch("/api/stats");
+    const hitPct = ((s.cache_hit_ratio || 0) * 100).toFixed(1);
+    const d1ReadPct = (((s.d1_rows_read || 0) / 5000000) * 100).toFixed(4);
+    const d1WritePct = (((s.d1_rows_written || 0) / 100000) * 100).toFixed(3);
+    const aiBudgetPct = (((s.ai_calls_today || 0) / (s.daily_ai_budget || 50)) * 100).toFixed(1);
+
+    detailEl.innerHTML = `
+      <h2>📊 Sổ cái Quản trị Tài nguyên Đám mây (Cloud FinOps Ledger)</h2>
+      <p style="font-size:0.86rem; color:#475569; margin-bottom:1rem;">
+        Ngày ghi nhận (UTC): <strong>${escapeHtml(s.day)}</strong> • Tự động giám sát hạn mức gói Cloudflare Free Tier
+      </p>
+
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; margin-bottom:1rem;">
+        <div class="paper-card" style="cursor:default;">
+          <small>⚡ Tỷ lệ trúng bộ nhớ đệm (D1 Cache Hit Ratio)</small>
+          <h3 style="font-size:1.4rem; color:#15803d;">${hitPct}%</h3>
+          <small>${s.cache_hits} HIT / ${s.cache_misses} MISS (Tiết kiệm ${s.cache_hits} lượt gọi ngoài)</small>
+        </div>
+        <div class="paper-card" style="cursor:default;">
+          <small>🤖 Ngân sách Phân tích AI trong ngày</small>
+          <h3 style="font-size:1.4rem; color:#0284c7;">${s.ai_calls_today} / ${s.daily_ai_budget} lượt (${aiBudgetPct}%)</h3>
+          <small>Giới hạn mỗi IP: tối đa ${s.per_ip_daily_limit || 5} bài/ngày</small>
+        </div>
+      </div>
+
+      <table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
+        <thead>
+          <tr style="background:#f1f5f9; text-align:left;">
+            <th style="padding:0.55rem; border:1px solid #e2e8f0;">Tài nguyên Đám mây</th>
+            <th style="padding:0.55rem; border:1px solid #e2e8f0;">Đã dùng hôm nay</th>
+            <th style="padding:0.55rem; border:1px solid #e2e8f0;">Trần Free Tier / Ngày</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">Cloudflare D1 Rows Read</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;"><strong>${(s.d1_rows_read || 0).toLocaleString("vi-VN")}</strong> dòng</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">5.000.000 dòng (${d1ReadPct}%)</td>
+          </tr>
+          <tr>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">Cloudflare D1 Rows Written</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;"><strong>${(s.d1_rows_written || 0).toLocaleString("vi-VN")}</strong> dòng</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">100.000 dòng (${d1WritePct}%)</td>
+          </tr>
+          <tr>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">OpenAlex API Subrequests</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;"><strong>${s.oa_calls_today || 0}</strong> lượt gọi</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">~$1.00 / ngày (Free API Key)</td>
+          </tr>
+          <tr>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">Tổng dữ liệu đã lưu trữ trong D1</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;"><strong>${s.stored_papers_count || 0}</strong> bài báo / <strong>${s.stored_analyses_count || 0}</strong> bản AI</td>
+            <td style="padding:0.55rem; border:1px solid #e2e8f0;">5 GB dung lượng lưu trữ</td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+  } catch (err) {
+    detailEl.innerHTML = `<p style="color:#dc2626;">Không thể tải sổ cái FinOps: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+const finopsBar = document.getElementById("finops-bar");
+if (finopsBar) {
+  finopsBar.style.cursor = "pointer";
+  finopsBar.title = "Bấm để xem chi tiết Sổ cái Tài nguyên Đám mây (FinOps Ledger)";
+  finopsBar.addEventListener("click", renderFinOpsDashboardModal);
+}
