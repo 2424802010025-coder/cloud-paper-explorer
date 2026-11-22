@@ -1,9 +1,11 @@
 /**
- * GIAI ĐOẠN 4 - KỸ SƯ 2: HOÀN THIỆN SPA CLOUDSCHOLAR
+ * GIAI ĐOẠN 6 - KỸ SƯ 2: HOÀN THIỆN & TỐI ƯU HÓA SPA CLOUDSCHOLAR
  * - GĐ1: client_id (localStorage), chống DOM/URI XSS, FinOps & Server-Timing
  * - GĐ2: Tìm kiếm, lọc năm, huy hiệu Cache HIT/MISS, phân trang, khóa AI khi thiếu Abstract
  * - GĐ3: Phân tích Workers AI (GET cache trước, POST khi bấm), lọc nhãn câu & cảnh báo ai_generated
- * - GĐ4: Xuất BibTeX/IEEE, quản lý Bookmark + ghi chú & Đồ thị trích dẫn Cytoscape.js
+ * - GĐ4: Xuất BibTeX/IEEE, quản lý Bookmark + ghi chú & Đồ thị trích dẫn Cytoscape.js (Lazy Load)
+ * - GĐ5: Sổ cái FinOps Free Tier Ledger & hộp cảnh báo cam cho lỗi HTTP 429
+ * - GĐ6: RAM Session Cache (Map 0 ms), khóa chống bấm đúp (In-flight Lock) & thẻ phân rã Server-Timing
  */
 
 let currentPapers = [];
@@ -11,7 +13,13 @@ let savedBookmarks = [];
 let currentPage = 1;
 let currentTotal = 0;
 
-// ==================== 1. BẢO MẬT & ĐỊNH DANH CLIENT ====================
+// Bộ nhớ đệm trong RAM trình duyệt cho phiên hiện tại & khóa chống bấm đúp
+const clientAnalysisCache = new Map();
+const clientGraphCache = new Map();
+let isSearchInFlight = false;
+let isAiInFlight = false;
+
+// ==================== 1. BẢO MẬT, ĐỊNH DANH & SERVER-TIMING ====================
 
 function escapeHtml(str) {
   if (!str) return "";
@@ -42,6 +50,34 @@ function getOrCreateClientId() {
   return clientId;
 }
 
+function parseServerTimingHeader(headerStr) {
+  if (!headerStr) return [];
+  return headerStr.split(",").map((part) => {
+    const tokens = part.trim().split(";");
+    const name = tokens[0] || "metric";
+    let dur = "0";
+    for (const t of tokens) {
+      if (t.startsWith("dur=")) dur = t.replace("dur=", "");
+    }
+    return { name, dur: Number(dur).toFixed(1) };
+  });
+}
+
+function renderTimingPills(headerStr, roundtripMs) {
+  const pillsEl = document.getElementById("timing-pills");
+  if (!pillsEl) return;
+  const metrics = parseServerTimingHeader(headerStr);
+  const pillsHtml = metrics
+    .map(
+      (m) =>
+        `<span style="background:#f1f5f9; border:1px solid #cbd5e1; color:#334155; padding:0.15rem 0.5rem; border-radius:999px; font-size:0.75rem;">⏱️ <strong>${escapeHtml(m.name)}</strong>: ${escapeHtml(m.dur)} ms</span>`
+    )
+    .join("");
+  pillsEl.innerHTML =
+    pillsHtml +
+    `<span style="background:#e0f2fe; border:1px solid #7dd3fc; color:#0369a1; padding:0.15rem 0.5rem; border-radius:999px; font-size:0.75rem;">🌐 <strong>RTT</strong>: ${escapeHtml(roundtripMs)} ms</span>`;
+}
+
 const CLIENT_ID = getOrCreateClientId();
 
 async function apiFetch(endpoint, options = {}) {
@@ -60,9 +96,10 @@ async function apiFetch(endpoint, options = {}) {
   if (latencyEl) {
     latencyEl.textContent = `Server-Timing: ${serverTiming} (Tổng: ${roundtripMs} ms)`;
   }
+  renderTimingPills(serverTiming, roundtripMs);
 
   const data = await response.json();
-if (!response.ok) {
+  if (!response.ok) {
     const err = new Error(data?.error?.message || `Lỗi HTTP ${response.status}`);
     err.status = response.status;
     throw err;
@@ -153,9 +190,11 @@ async function copyText(text, feedbackEl, successMsg) {
   }
 }
 
-// ==================== 3. TÌM KIẾM & PHÂN TRANG ====================
+// ==================== 3. TÌM KIẾM & PHÂN TRANG (CÓ IN-FLIGHT LOCK) ====================
 
 async function executeSearch(page = 1) {
+  if (isSearchInFlight) return;
+
   const q = document.getElementById("q-input").value.trim();
   const fromYear = Number(document.getElementById("from-year").value || 2020);
   const toYear = Number(document.getElementById("to-year").value || 2026);
@@ -164,12 +203,15 @@ async function executeSearch(page = 1) {
 
   const listEl = document.getElementById("results-list");
   const metaEl = document.getElementById("search-meta");
+  const submitBtn = document.querySelector('#search-form button[type="submit"]');
 
   if (fromYear > toYear) {
     metaEl.innerHTML = `<span style="color:#dc2626; font-weight:600;">⚠️ Năm bắt đầu (${fromYear}) không được lớn hơn năm kết thúc (${toYear}).</span>`;
     return;
   }
 
+  isSearchInFlight = true;
+  if (submitBtn) submitBtn.disabled = true;
   currentPage = page;
   listEl.innerHTML = "<p>⏳ Đang truy vấn dữ liệu học thuật qua Cloudflare Edge...</p>";
 
@@ -254,10 +296,13 @@ async function executeSearch(page = 1) {
     loadFinOpsStats();
   } catch (err) {
     listEl.innerHTML = `<p style="color:#dc2626;">❌ Lỗi truy vấn: ${escapeHtml(err.message)}</p>`;
+  } finally {
+    isSearchInFlight = false;
+    if (submitBtn) submitBtn.disabled = false;
   }
 }
 
-// ==================== 4. PHÂN TÍCH WORKERS AI & TÔ MÀU ABSTRACT ====================
+// ==================== 4. PHÂN TÍCH WORKERS AI (RAM CACHE + IN-FLIGHT LOCK) ====================
 
 function renderAnalysisResult(aiData, activeFilter = "all") {
   const abstractBox = document.getElementById("abstract-box");
@@ -314,6 +359,18 @@ function renderAnalysisResult(aiData, activeFilter = "all") {
 }
 
 async function checkExistingAnalysis(paperId) {
+  const btn = document.getElementById("btn-run-ai");
+
+  // Ưu tiên RAM Session Cache của trình duyệt (0 ms, 0 request mạng)
+  if (clientAnalysisCache.has(paperId)) {
+    renderAnalysisResult(clientAnalysisCache.get(paperId));
+    if (btn) {
+      btn.textContent = "⚡ Đã tải từ RAM Cache (0 ms)";
+      btn.disabled = true;
+    }
+    return;
+  }
+
   try {
     const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/analysis`, {
       method: "GET",
@@ -321,8 +378,8 @@ async function checkExistingAnalysis(paperId) {
     });
     if (response.ok) {
       const cachedAiData = await response.json();
+      clientAnalysisCache.set(paperId, cachedAiData);
       renderAnalysisResult(cachedAiData);
-      const btn = document.getElementById("btn-run-ai");
       if (btn) {
         btn.textContent = "✅ Đã tải phân tích từ D1 Cache";
         btn.disabled = true;
@@ -333,13 +390,22 @@ async function checkExistingAnalysis(paperId) {
   }
 }
 
-async function runAiAnalysis(paper) {
-  const btn = document.getElementById("btn-run-ai");
+async function triggerAiAnalysisSafe(paper, buttonEl) {
+  if (isAiInFlight) return;
   const outBox = document.getElementById("ai-output-box");
-  if (!btn || !outBox) return;
+  if (!buttonEl || !outBox) return;
 
-  btn.disabled = true;
-  btn.textContent = "⏳ Đang phân tích bằng Workers AI...";
+  if (clientAnalysisCache.has(paper.paper_id)) {
+    renderAnalysisResult(clientAnalysisCache.get(paper.paper_id));
+    buttonEl.textContent = "⚡ Đã tải từ RAM Cache (0 ms)";
+    buttonEl.disabled = true;
+    return;
+  }
+
+  isAiInFlight = true;
+  const originalText = buttonEl.textContent;
+  buttonEl.disabled = true;
+  buttonEl.textContent = "⏳ Đang phân tích trên Cloudflare Workers AI...";
   outBox.innerHTML = `<p style="color:#475569;">⏳ Đang gửi Abstract tới Cloudflare Workers AI, vui lòng chờ vài giây...</p>`;
 
   try {
@@ -350,12 +416,13 @@ async function runAiAnalysis(paper) {
         abstract: paper.abstract,
       }),
     });
+    clientAnalysisCache.set(paper.paper_id, aiData);
     renderAnalysisResult(aiData);
-    btn.textContent = "✅ Đã hoàn tất phân tích AI";
-    loadFinOpsStats();
- } catch (err) {
-    btn.disabled = false;
-    btn.textContent = "✨ Phân tích & Tô màu Abstract";
+    buttonEl.textContent = "✅ Đã hoàn tất phân tích AI";
+    await loadFinOpsStats();
+  } catch (err) {
+    buttonEl.disabled = false;
+    buttonEl.textContent = originalText;
     if (err.status === 429) {
       outBox.innerHTML = `
         <div style="padding: 0.85rem; background: #fff7ed; border: 1px solid #fdba74; color: #9a3412; border-radius: 6px;">
@@ -370,10 +437,12 @@ async function runAiAnalysis(paper) {
         </div>
       `;
     }
+  } finally {
+    isAiInFlight = false;
   }
 }
 
-// ==================== 5. ĐỒ THỊ TRÍCH DẪN CYTOSCAPE.JS ====================
+// ==================== 5. ĐỒ THỊ TRÍCH DẪN CYTOSCAPE.JS (LAZY LOAD + RAM CACHE) ====================
 
 async function renderCitationGraph(paperId) {
   const section = document.getElementById("graph-section");
@@ -384,6 +453,7 @@ async function renderCitationGraph(paperId) {
   container.innerHTML = "<p style='padding:1rem;'>⏳ Đang dựng đồ thị trích dẫn từ OpenAlex & D1 Cache...</p>";
 
   try {
+    // Lazy Loading Cytoscape.js: chỉ tải ~350 KB khi người dùng thực sự bấm mở đồ thị
     if (!window.cytoscape) {
       await new Promise((resolve, reject) => {
         const script = document.createElement("script");
@@ -394,9 +464,14 @@ async function renderCitationGraph(paperId) {
       });
     }
 
-    const res = await apiFetch(`/api/papers/${encodeURIComponent(paperId)}/graph`);
-    const { nodes, edges } = res.graph || { nodes: [], edges: [] };
+    let graphData = clientGraphCache.get(paperId);
+    if (!graphData) {
+      const res = await apiFetch(`/api/papers/${encodeURIComponent(paperId)}/graph`);
+      graphData = res.graph || { nodes: [], edges: [] };
+      clientGraphCache.set(paperId, graphData);
+    }
 
+    const { nodes, edges } = graphData;
     if (nodes.length <= 1) {
       container.innerHTML =
         "<p style='padding:1rem; color:#475569;'>Bài báo này không công bố danh sách tài liệu tham khảo (referenced_works) trên OpenAlex.</p>";
@@ -476,22 +551,16 @@ async function refreshBookmarks() {
 }
 
 async function toggleBookmark(paperId, noteText = "") {
-  const exists = savedBookmarks.some((bookmark) => bookmark.paper_id === paperId);
-
-  try {
-    if (exists) {
-      await apiFetch(`/api/bookmarks/${encodeURIComponent(paperId)}`, { method: "DELETE" });
-    } else {
-      await apiFetch("/api/bookmarks", {
-        method: "POST",
-        body: JSON.stringify({ paper_id: paperId, note: noteText }),
-      });
-    }
-
-    await refreshBookmarks();
-  } catch (err) {
-    alert(`Không thể cập nhật Bookmark: ${err.message}`);
+  const exists = savedBookmarks.some((b) => b.paper_id === paperId);
+  if (exists) {
+    await apiFetch(`/api/bookmarks/${encodeURIComponent(paperId)}`, { method: "DELETE" });
+  } else {
+    await apiFetch(`/api/bookmarks/${encodeURIComponent(paperId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ note: noteText }),
+    });
   }
+  await refreshBookmarks();
 }
 
 function renderBookmarksTab() {
@@ -499,162 +568,144 @@ function renderBookmarksTab() {
   if (!listEl) return;
 
   if (savedBookmarks.length === 0) {
-    listEl.innerHTML = '<p>Chưa có bài báo nào trong danh sách Bookmark.</p>';
+    listEl.innerHTML = `
+      <div class="paper-card">
+        <p style="color:#475569;">Chưa có bài báo nào được lưu. Hãy chọn một bài báo ở tab Tìm kiếm rồi bấm <strong>🔖 Lưu Bookmark</strong>.</p>
+      </div>
+    `;
     return;
   }
 
   listEl.innerHTML = savedBookmarks
-    .map((item) => {
-      const paper = item.paper || item;
-      const note = item.note ? escapeHtml(item.note) : "";
-      return `
-        <article class="paper-card bookmark-card" data-id="${escapeHtml(paper.paper_id)}">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
-            <h3 style="margin:0; font-size:1rem;">${escapeHtml(paper.title)}</h3>
-            <button type="button" class="btn-outline btn-remove-bookmark" data-paper-id="${escapeHtml(paper.paper_id)}">Bỏ lưu</button>
-          </div>
-          <p style="font-size:0.84rem; color:#475569;">${escapeHtml(paper.authors?.join(", ") || "Chưa rõ tác giả")}</p>
-          ${note ? `<p class="bookmark-note">Ghi chú: ${note}</p>` : ""}
-        </article>
-      `;
-    })
+    .map(
+      (b) => `
+    <article class="paper-card" data-id="${escapeHtml(b.paper_id)}">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;">
+        <small>${escapeHtml(b.year || "N/A")} • <strong>${Number(b.cited_by || 0)}</strong> trích dẫn • ${escapeHtml(b.venue || "OpenAlex")}</small>
+        <button type="button" class="btn-outline btn-remove-bm" data-id="${escapeHtml(b.paper_id)}" style="font-size:0.75rem; padding:0.2rem 0.5rem;">🗑️ Xóa</button>
+      </div>
+      <h3 style="margin: 0.4rem 0; font-size: 1rem;">${escapeHtml(b.title)}</h3>
+      ${b.note ? `<p style="font-size: 0.84rem; color: #0369a1; margin-top: 0.25rem;">📝 <strong>Ghi chú:</strong> ${escapeHtml(b.note)}</p>` : ""}
+    </article>
+  `
+    )
     .join("");
 
-  listEl.querySelectorAll(".bookmark-card").forEach((card) => {
-    card.addEventListener("click", (event) => {
-      if (!event.target.closest(".btn-remove-bookmark")) {
-        showPaperDetail(card.dataset.id);
-      }
-    });
+  listEl.querySelectorAll(".paper-card").forEach((card) => {
+    card.addEventListener("click", () => showPaperDetail(card.dataset.id));
   });
 
-  listEl.querySelectorAll(".btn-remove-bookmark").forEach((button) => {
-    button.addEventListener("click", () => toggleBookmark(button.dataset.paperId));
+  listEl.querySelectorAll(".btn-remove-bm").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await apiFetch(`/api/bookmarks/${encodeURIComponent(btn.dataset.id)}`, { method: "DELETE" });
+      await refreshBookmarks();
+    });
   });
 }
+
+// ==================== 7. CHI TIẾT BÀI BÁO ====================
 
 async function showPaperDetail(paperId) {
-  const panel = document.getElementById("detail-panel");
-  if (!panel) return;
+  const paper =
+    currentPapers.find((p) => p.paper_id === paperId) ||
+    savedBookmarks.find((b) => b.paper_id === paperId);
+  if (!paper) return;
 
-  panel.innerHTML = '<div class="empty-state">Đang tải chi tiết bài báo...</div>';
+  const hasAbs = Boolean(paper.abstract && paper.abstract.trim().length > 20);
+  const safeHref = safeExternalUrl(paper.doi || paper.url);
+  const existingBm = savedBookmarks.find((b) => b.paper_id === paper.paper_id);
+  const isBookmarked = Boolean(existingBm);
+  const detailEl = document.getElementById("detail-panel");
 
-  try {
-    let paper = currentPapers.find((item) => item.paper_id === paperId);
-    if (!paper) {
-      paper = await apiFetch(`/api/papers/${encodeURIComponent(paperId)}`);
-    }
+  detailEl.innerHTML = `
+    <h2>${escapeHtml(paper.title)}</h2>
+    <p style="margin: 0.5rem 0; font-size: 0.88rem; color: #475569;">
+      Mã: <code>${escapeHtml(paper.paper_id)}</code> • Năm: <strong>${escapeHtml(paper.year || "N/A")}</strong> •
+      Trích dẫn: <strong>${Number(paper.cited_by || 0)}</strong> •
+      <a href="${escapeHtml(safeHref)}" target="_blank" rel="noopener noreferrer">Mở bài báo gốc (DOI/URL)</a>
+    </p>
 
-    const isBookmarked = savedBookmarks.some((bookmark) =>
-      (bookmark.paper_id || bookmark.paper?.paper_id) === paperId
-    );
-    const hasAbstract = Boolean(paper.abstract && paper.abstract.trim().length >= 20);
+    <div class="action-row" style="margin: 0.9rem 0;">
+      <button id="btn-run-ai" class="btn-primary" ${hasAbs ? "" : "disabled"}>
+        ${hasAbs ? "✨ Phân tích & Tô màu Abstract" : "🚫 Không có Abstract"}
+      </button>
+      <button id="btn-toggle-bm" class="btn-outline">
+        ${isBookmarked ? "🗑️ Bỏ lưu Bookmark" : "🔖 Lưu Bookmark"}
+      </button>
+      <button id="btn-copy-ieee" class="btn-outline">📋 Copy IEEE</button>
+      <button id="btn-dl-bib" class="btn-outline">📥 Tải file .bib</button>
+      <button id="btn-show-graph" class="btn-outline">🕸️ Xem Đồ thị Trích dẫn</button>
+    </div>
+    <div id="copy-feedback" class="copy-feedback"></div>
 
-    panel.innerHTML = `
-      <article class="paper-detail">
-        <h2>${escapeHtml(paper.title)}</h2>
-        <p><strong>Tác giả:</strong> ${escapeHtml((paper.authors || []).join(", ") || "Chưa rõ")}</p>
-        <p><strong>Nguồn:</strong> ${escapeHtml(paper.venue || "OpenAlex")} • <strong>Năm:</strong> ${escapeHtml(paper.year || "N/A")}</p>
-        ${paper.doi ? `<p><strong>DOI:</strong> <a href="${safeExternalUrl(paper.doi)}" target="_blank" rel="noopener noreferrer">${escapeHtml(paper.doi)}</a></p>` : ""}
-        ${paper.url ? `<p><a href="${safeExternalUrl(paper.url)}" target="_blank" rel="noopener noreferrer">Mở trên OpenAlex</a></p>` : ""}
+    <div class="note-box">
+      <input type="text" id="bookmark-note-input" placeholder="Ghi chú cá nhân cho bài báo này (tùy chọn)..." value="${escapeHtml(existingBm?.note || "")}" />
+      ${isBookmarked ? `<button id="btn-save-note" class="btn-outline">💾 Lưu ghi chú</button>` : ""}
+    </div>
 
-        <div class="action-row">
-          <button type="button" id="btn-toggle-bookmark" class="btn-outline">${isBookmarked ? "★ Đã lưu" : "☆ Lưu bài báo"}</button>
-          <button type="button" id="btn-copy-bib" class="btn-outline">Copy BibTeX</button>
-          <button type="button" id="btn-copy-ieee" class="btn-outline">Copy IEEE</button>
-        </div>
+    <div id="abstract-box" style="padding: 0.85rem; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;">
+      <strong>Abstract gốc:</strong>
+      <p style="margin-top: 0.4rem;">
+        ${hasAbs ? escapeHtml(paper.abstract) : "Bài báo này không công bố dữ liệu Abstract trên kho OpenAlex nên chức năng phân tích AI tự động được khóa để tiết kiệm tài nguyên."}
+      </p>
+    </div>
 
-        <section>
-          <h3>Abstract</h3>
-          <div id="abstract-box">${escapeHtml(paper.abstract || "Bài báo này không có Abstract.")}</div>
-        </section>
+    <div id="ai-output-box" style="margin-top: 1rem;"></div>
 
-        <section>
-          <button type="button" id="btn-run-ai" class="btn-primary" ${hasAbstract ? "" : "disabled"}>✨ Phân tích & Tô màu Abstract</button>
-          <div id="ai-output-box"></div>
-        </section>
+    <div id="graph-section" style="display:none; margin-top: 1rem;">
+      <strong>🕸️ Đồ thị trích dẫn (Cytoscape.js):</strong>
+      <div id="cy-graph-container"></div>
+      <div id="graph-node-info">Bấm vào một đỉnh bất kỳ trên đồ thị để xem tiêu đề đầy đủ và số trích dẫn.</div>
+    </div>
+  `;
 
-        <section id="graph-section">
-          <h3>Đồ thị trích dẫn</h3>
-          <div id="cy-graph-container"></div>
-        </section>
-      </article>
-    `;
+  const feedbackEl = document.getElementById("copy-feedback");
 
-    document.getElementById("btn-toggle-bookmark")?.addEventListener("click", () => {
-      const existing = savedBookmarks.find((bookmark) =>
-        (bookmark.paper_id || bookmark.paper?.paper_id) === paperId
-      );
-      const note = existing?.note || "";
-      toggleBookmark(paperId, note);
-    });
-
-    document.getElementById("btn-copy-bib")?.addEventListener("click", () => {
-      copyText(formatBibTeX(paper), null, "Đã copy BibTeX");
-    });
-
-    document.getElementById("btn-copy-ieee")?.addEventListener("click", () => {
-      copyText(formatIEEE(paper), null, "Đã copy IEEE");
-    });
-
-    document.getElementById("btn-run-ai")?.addEventListener("click", () => runAiAnalysis(paper));
-
-    checkExistingAnalysis(paperId);
-    renderCitationGraph(paperId);
-  } catch (err) {
-    panel.innerHTML = `<div class="empty-state" style="color:#dc2626;">Không tải được chi tiết: ${escapeHtml(err.message)}</div>`;
+  if (hasAbs) {
+    const runBtn = document.getElementById("btn-run-ai");
+    runBtn?.addEventListener("click", () => triggerAiAnalysisSafe(paper, runBtn));
+    checkExistingAnalysis(paper.paper_id);
   }
-}
 
-function switchTab(tabId) {
-  document.querySelectorAll(".tab-btn").forEach((button) => {
-    button.classList.toggle("active", button.dataset.tab === tabId);
-  });
-  document.querySelectorAll("main > section.left-panel").forEach((section) => {
-    section.style.display = section.id === tabId ? "block" : "none";
-  });
-}
-
-document.querySelectorAll(".tab-btn").forEach((button) => {
-  button.addEventListener("click", () => switchTab(button.dataset.tab));
-});
-
-const searchForm = document.getElementById("search-form");
-if (searchForm) {
-  searchForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    executeSearch(1);
-  });
-}
-
-const exportBibButton = document.getElementById("btn-export-all-bib");
-if (exportBibButton) {
-  exportBibButton.addEventListener("click", () => {
-    const papers = savedBookmarks.map((item) => item.paper || item);
-    if (papers.length === 0) {
-      alert("Chưa có bài báo nào để xuất.");
-      return;
+  document.getElementById("btn-toggle-bm")?.addEventListener("click", async () => {
+    const noteText = document.getElementById("bookmark-note-input")?.value.trim() || "";
+    try {
+      await toggleBookmark(paper.paper_id, noteText);
+      showPaperDetail(paper.paper_id);
+    } catch (err) {
+      alert(`Lỗi cập nhật Bookmark: ${err.message}`);
     }
-    downloadTextFile("cloudscholar-bookmarks.bib", papers.map(formatBibTeX).join("\n\n"));
   });
-}
 
-const exportIeeeButton = document.getElementById("btn-export-all-ieee");
-if (exportIeeeButton) {
-  exportIeeeButton.addEventListener("click", () => {
-    const papers = savedBookmarks.map((item) => item.paper || item);
-    if (papers.length === 0) {
-      alert("Chưa có bài báo nào để copy.");
-      return;
+  document.getElementById("btn-save-note")?.addEventListener("click", async () => {
+    const noteText = document.getElementById("bookmark-note-input")?.value.trim() || "";
+    try {
+      await apiFetch(`/api/bookmarks/${encodeURIComponent(paper.paper_id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ note: noteText }),
+      });
+      await refreshBookmarks();
+      if (feedbackEl) feedbackEl.textContent = "✅ Đã cập nhật ghi chú!";
+    } catch (err) {
+      alert(`Lỗi lưu ghi chú: ${err.message}`);
     }
-    const text = papers.map((paper, index) => formatIEEE(paper, index + 1)).join("\n");
-    copyText(text, null, "Đã copy danh sách IEEE");
+  });
+
+  document.getElementById("btn-copy-ieee")?.addEventListener("click", () => {
+    copyText(formatIEEE(paper, 1), feedbackEl, "✅ Đã copy trích dẫn IEEE vào Clipboard!");
+  });
+
+  document.getElementById("btn-dl-bib")?.addEventListener("click", () => {
+    downloadTextFile(`${paper.paper_id || "paper"}.bib`, formatBibTeX(paper));
+  });
+
+  document.getElementById("btn-show-graph")?.addEventListener("click", () => {
+    renderCitationGraph(paper.paper_id);
   });
 }
 
-refreshBookmarks();
-executeSearch(1);
-// ==================== 9. SỔ CÁI TÀI NGUYÊN ĐÁM MÂY (FINOPS LEDGER) ====================
+// ==================== 8. SỔ CÁI TÀI NGUYÊN ĐÁM MÂY (FINOPS LEDGER) ====================
 
 async function renderFinOpsDashboardModal() {
   const detailEl = document.getElementById("detail-panel");
@@ -723,9 +774,44 @@ async function renderFinOpsDashboardModal() {
   }
 }
 
+// ==================== 9. KHỞI TẠO SỰ KIỆN ====================
+
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    const target = btn.dataset.tab;
+    document.getElementById("search-tab").style.display = target === "search-tab" ? "block" : "none";
+    document.getElementById("bookmarks-tab").style.display = target === "bookmarks-tab" ? "block" : "none";
+    if (target === "bookmarks-tab") refreshBookmarks();
+  });
+});
+
+document.getElementById("btn-export-all-ieee")?.addEventListener("click", () => {
+  if (savedBookmarks.length === 0) return alert("Chưa có bài báo nào trong Bookmark để xuất.");
+  const allIeee = savedBookmarks.map((b, i) => formatIEEE(b, i + 1)).join("\n\n");
+  copyText(allIeee, null, "");
+  alert(`Đã copy ${savedBookmarks.length} trích dẫn chuẩn IEEE vào Clipboard!`);
+});
+
+document.getElementById("btn-export-all-bib")?.addEventListener("click", () => {
+  if (savedBookmarks.length === 0) return alert("Chưa có bài báo nào trong Bookmark để xuất.");
+  const allBib = savedBookmarks.map((b) => formatBibTeX(b)).join("\n\n");
+  downloadTextFile("cloudscholar_bookmarks.bib", allBib);
+});
+
+document.getElementById("search-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  executeSearch(1);
+});
+
 const finopsBar = document.getElementById("finops-bar");
 if (finopsBar) {
   finopsBar.style.cursor = "pointer";
   finopsBar.title = "Bấm để xem chi tiết Sổ cái Tài nguyên Đám mây (FinOps Ledger)";
   finopsBar.addEventListener("click", renderFinOpsDashboardModal);
 }
+
+loadFinOpsStats();
+refreshBookmarks();
+executeSearch(1);
