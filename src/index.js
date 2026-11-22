@@ -1,9 +1,16 @@
 /**
- * GIAI ĐOẠN 3 - KỸ SƯ 1: TÌM KIẾM OPENALEX + CACHE D1 + WORKERS AI JSON MODE QUA AI GATEWAY
+ * GIAI ĐOẠN 4 - KỸ SƯ 1: TÌM KIẾM OPENALEX + WORKERS AI + BOOKMARKS + ĐỒ THỊ TRÍCH DẪN + CITE API
  */
 import { searchOpenAlex, normalizeOpenAlexWork } from "./openalex.js";
 import { upsertPapersBatch, formatPaperRow, recordDailyUsage, getTodayKey } from "./db_service.js";
 import { isValidPaperId, analyzePaperWithFallback } from "./ai_service.js";
+import {
+  validateClientId,
+  listBookmarks,
+  saveBookmark,
+  removeBookmark,
+  getPaperCitationGraph,
+} from "./features_service.js";
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -20,7 +27,7 @@ function errorResponse(code, message, status = 400, extraHeaders = {}) {
   return jsonResponse({ error: { code, message } }, status, extraHeaders);
 }
 
-// 1. Xử lý tìm kiếm bài báo thật kết hợp Cache phân tầng TTL trong D1
+// 1. Tìm kiếm bài báo thật + Cache phân tầng TTL trong D1
 async function handleSearchRequest(url, env, ctx) {
   const q = (url.searchParams.get("q") || "").trim().replace(/\s+/g, " ").toLowerCase();
   const fromYear = url.searchParams.get("from") || "2020";
@@ -104,7 +111,7 @@ async function handleSearchRequest(url, env, ctx) {
   };
 }
 
-// 2. Xử lý Phân tích AI thật (GET chỉ đọc Cache, POST chạy Workers AI qua AI Gateway + Lưu D1)
+// 2. Phân tích AI thật qua AI Gateway + Lưu D1
 async function handleAnalysisRequest(paperId, method, env, ctx) {
   if (!isValidPaperId(paperId)) {
     return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ (phải có dạng W kèm chữ số).", 400);
@@ -137,18 +144,16 @@ async function handleAnalysisRequest(paperId, method, env, ctx) {
     );
   }
 
-  // Nếu là GET mà chưa có trong Cache -> trả 404 (không tự chạy AI)
   if (method === "GET") {
     return errorResponse("analysis_not_found", "Bài báo này chưa có bản phân tích AI trong Cache.", 404);
   }
 
-  // Đọc bài báo từ D1 (chỉ dùng abstract trong D1, không nhận text tự do từ Client)
   const paper = await env.DB.prepare("SELECT paper_id, title, abstract FROM papers WHERE paper_id = ?1")
     .bind(paperId)
     .first();
 
   if (!paper) {
-    return errorResponse("paper_not_found", `Không tìm thấy bài báo ${paperId} trong D1. Hãy tìm kiếm bài báo trước.`, 404);
+    return errorResponse("paper_not_found", `Không tìm thấy bài báo ${paperId} trong D1.`, 404);
   }
   if (!paper.abstract || paper.abstract.trim().length < 20) {
     return errorResponse("abstract_empty", "Bài báo này không có nội dung Abstract để phân tích.", 422);
@@ -163,7 +168,6 @@ async function handleAnalysisRequest(paperId, method, env, ctx) {
   }
   const aiInferMs = (performance.now() - tAiStart).toFixed(2);
 
-  // Chỉ lưu vào bảng analyses khi đầu ra JSON hoàn toàn hợp lệ
   const tWrite = performance.now();
   const nowSec = Math.floor(Date.now() / 1000);
   await env.DB.prepare(
@@ -177,9 +181,7 @@ async function handleAnalysisRequest(paperId, method, env, ctx) {
     .run();
   const d1WriteMs = (performance.now() - tWrite).toFixed(2);
 
-  ctx.waitUntil(
-    recordDailyUsage(env.DB, { aiCalls: 1, misses: 1, rowsRead: 2, rowsWritten: 1 })
-  );
+  ctx.waitUntil(recordDailyUsage(env.DB, { aiCalls: 1, misses: 1, rowsRead: 2, rowsWritten: 1 }));
 
   return jsonResponse(
     {
@@ -209,6 +211,7 @@ export default {
     }
 
     try {
+      // 1. Health Check
       if (path === "/api/health" && method === "GET") {
         const t0 = performance.now();
         const dbCheck = await env.DB.prepare(
@@ -227,39 +230,100 @@ export default {
         );
       }
 
+      // 2. Search API
       if (path === "/api/search" && method === "GET") {
         const { payload, serverTiming } = await handleSearchRequest(url, env, ctx);
         return jsonResponse(payload, 200, { "Server-Timing": serverTiming });
       }
 
+      // 3. Paper Detail API
       const paperDetailMatch = path.match(/^\/api\/papers\/([^/]+)$/);
       if (paperDetailMatch && method === "GET") {
         const paperId = paperDetailMatch[1];
-        if (!isValidPaperId(paperId)) {
-          return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ.", 400);
-        }
+        if (!isValidPaperId(paperId)) return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ.", 400);
         const row = await env.DB.prepare("SELECT * FROM papers WHERE paper_id = ?1").bind(paperId).first();
-        if (!row) {
-          return errorResponse("paper_not_found", `Không tìm thấy bài báo ${paperId} trong CSDL`, 404);
-        }
+        if (!row) return errorResponse("paper_not_found", `Không tìm thấy bài báo ${paperId}`, 404);
         return jsonResponse(formatPaperRow(row));
       }
 
+      // 4. AI Analysis API
       const analysisMatch = path.match(/^\/api\/papers\/([^/]+)\/analysis$/);
       if (analysisMatch && (method === "GET" || method === "POST")) {
         return await handleAnalysisRequest(analysisMatch[1], method, env, ctx);
       }
 
+      // 5. Citation Graph API (Gom 1 subrequest + Cache 30 ngày)
+      const graphMatch = path.match(/^\/api\/papers\/([^/]+)\/graph$/);
+      if (graphMatch && method === "GET") {
+        const t0 = performance.now();
+        try {
+          const result = await getPaperCitationGraph(env, ctx, graphMatch[1]);
+          return jsonResponse(result, 200, { "Server-Timing": `graph;dur=${(performance.now() - t0).toFixed(2)}` });
+        } catch (err) {
+          if (err.message === "invalid_paper_id") return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ.", 400);
+          if (err.message === "paper_not_found") return errorResponse("paper_not_found", "Không tìm thấy bài báo gốc trong D1.", 404);
+          throw err;
+        }
+      }
+
+      // 6. Cite Metadata API (Tối đa 50 mã bài báo)
+      if (path === "/api/cite" && method === "GET") {
+        const rawIds = (url.searchParams.get("ids") || "").split(",").map((s) => s.trim());
+        const validIds = [...new Set(rawIds.filter(isValidPaperId))].slice(0, 50);
+        if (validIds.length === 0) {
+          return errorResponse("invalid_ids", "Vui lòng truyền ít nhất 1 mã bài báo hợp lệ (?ids=W...).", 400);
+        }
+        const placeholders = validIds.map((_, i) => `?${i + 1}`).join(",");
+        const rows = await env.DB.prepare(`SELECT * FROM papers WHERE paper_id IN (${placeholders})`)
+          .bind(...validIds)
+          .all();
+        return jsonResponse({ count: (rows.results || []).length, items: (rows.results || []).map(formatPaperRow) });
+      }
+
+      // 7. Bookmarks API (GET /api/bookmarks, PUT/DELETE /api/bookmarks/:id)
+      if (path === "/api/bookmarks" && method === "GET") {
+        const clientId = validateClientId(request);
+        if (!clientId) return errorResponse("invalid_client_id", "Thiếu hoặc sai định dạng header X-Client-Id.", 400);
+        const items = await listBookmarks(env.DB, clientId);
+        return jsonResponse({ count: items.length, items });
+      }
+
+      const bookmarkMatch = path.match(/^\/api\/bookmarks\/([^/]+)$/);
+      if (bookmarkMatch && (method === "PUT" || method === "DELETE")) {
+        const clientId = validateClientId(request);
+        if (!clientId) return errorResponse("invalid_client_id", "Thiếu hoặc sai định dạng header X-Client-Id.", 400);
+        const paperId = bookmarkMatch[1];
+
+        try {
+          if (method === "PUT") {
+            const body = await request.json().catch(() => ({}));
+            const saved = await saveBookmark(env.DB, clientId, paperId, body.note || "");
+            return jsonResponse(saved);
+          } else {
+            const removed = await removeBookmark(env.DB, clientId, paperId);
+            return jsonResponse(removed);
+          }
+        } catch (err) {
+          if (err.message === "invalid_paper_id") return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ.", 400);
+          if (err.message === "paper_not_found") return errorResponse("paper_not_found", "Bài báo chưa tồn tại trong D1.", 404);
+          if (err.message === "bookmark_limit_reached") {
+            return errorResponse("bookmark_limit_reached", "Mỗi trình duyệt chỉ được lưu tối đa 50 bài báo yêu thích.", 429);
+          }
+          throw err;
+        }
+      }
+
+      // 8. Stats API
       if (path === "/api/stats" && method === "GET") {
         const day = getTodayKey();
         const dailyBudget = Number(env.DAILY_AI_BUDGET || 50);
-        const u = (await env.DB.prepare("SELECT * FROM usage_daily WHERE day = ?1").bind(day).first()) || {
-          ai_calls: 0,
-          oa_calls: 0,
-          cache_hits: 0,
-          cache_misses: 0,
-          d1_rows_read: 0,
-          d1_rows_written: 0,
+        const [usageRes, countPapersRes, countAnalysesRes] = await env.DB.batch([
+          env.DB.prepare("SELECT * FROM usage_daily WHERE day = ?1").bind(day),
+          env.DB.prepare("SELECT COUNT(*) AS total_papers FROM papers"),
+          env.DB.prepare("SELECT COUNT(*) AS total_analyses FROM analyses"),
+        ]);
+        const u = usageRes.results?.[0] || {
+          ai_calls: 0, oa_calls: 0, cache_hits: 0, cache_misses: 0, d1_rows_read: 0, d1_rows_written: 0,
         };
         const totalReqs = (u.cache_hits || 0) + (u.cache_misses || 0);
         return jsonResponse({
@@ -267,12 +331,15 @@ export default {
           ai_calls_today: u.ai_calls || 0,
           daily_ai_budget: dailyBudget,
           ai_budget_remaining: Math.max(0, dailyBudget - (u.ai_calls || 0)),
+          per_ip_daily_limit: Number(env.PER_IP_DAILY_AI_LIMIT || 5),
           oa_calls_today: u.oa_calls || 0,
           cache_hits: u.cache_hits || 0,
           cache_misses: u.cache_misses || 0,
           cache_hit_ratio: totalReqs > 0 ? Number(((u.cache_hits || 0) / totalReqs).toFixed(3)) : 0,
           d1_rows_read: u.d1_rows_read || 0,
           d1_rows_written: u.d1_rows_written || 0,
+          stored_papers_count: countPapersRes.results?.[0]?.total_papers || 0,
+          stored_analyses_count: countAnalysesRes.results?.[0]?.total_analyses || 0,
         });
       }
 
