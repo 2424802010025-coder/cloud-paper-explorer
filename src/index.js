@@ -1,5 +1,5 @@
 /**
- * GIAI ĐOẠN 4 - KỸ SƯ 1: TÌM KIẾM OPENALEX + WORKERS AI + BOOKMARKS + ĐỒ THỊ TRÍCH DẪN + CITE API
+ * GIAI ĐOẠN 5 - KỸ SƯ 1: TÍCH HỢP ĐẦY ĐỦ 8 LỚP BẢO MẬT, EDGE RATE LIMITING & FINOPS BUDGET
  */
 import { searchOpenAlex, normalizeOpenAlexWork } from "./openalex.js";
 import { upsertPapersBatch, formatPaperRow, recordDailyUsage, getTodayKey } from "./db_service.js";
@@ -11,6 +11,11 @@ import {
   removeBookmark,
   getPaperCitationGraph,
 } from "./features_service.js";
+import {
+  getClientIp,
+  checkEdgeRateLimit,
+  verifyAndConsumeAiBudget,
+} from "./security_finops.js";
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -18,6 +23,8 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
       ...extraHeaders,
     },
   });
@@ -111,8 +118,8 @@ async function handleSearchRequest(url, env, ctx) {
   };
 }
 
-// 2. Phân tích AI thật qua AI Gateway + Lưu D1
-async function handleAnalysisRequest(paperId, method, env, ctx) {
+// 2. Phân tích AI thật qua AI Gateway + Bảo vệ Ngân sách Kép (IP/ngày & Toàn hệ thống/ngày)
+async function handleAnalysisRequest(paperId, method, clientIp, env, ctx) {
   if (!isValidPaperId(paperId)) {
     return errorResponse("invalid_paper_id", "Mã bài báo không hợp lệ (phải có dạng W kèm chữ số).", 400);
   }
@@ -126,6 +133,7 @@ async function handleAnalysisRequest(paperId, method, env, ctx) {
     .first();
   const d1ReadMs = (performance.now() - tRead).toFixed(2);
 
+  // Cache HIT -> Trả ngay, KHÔNG trừ ngân sách AI!
   if (existing) {
     const parsed = JSON.parse(existing.result_json);
     ctx.waitUntil(recordDailyUsage(env.DB, { hits: 1, rowsRead: 1 }));
@@ -148,6 +156,12 @@ async function handleAnalysisRequest(paperId, method, env, ctx) {
     return errorResponse("analysis_not_found", "Bài báo này chưa có bản phân tích AI trong Cache.", 404);
   }
 
+  // Kiểm tra Edge Rate Limiting trước (0 chi phí D1)
+  const rl = await checkEdgeRateLimit(env.AI_RATE_LIMITER, `ai:${clientIp}`);
+  if (!rl.allowed) {
+    return errorResponse("rate_limited", "Bạn gọi phân tích AI quá nhanh (tối đa 5 lần/phút). Vui lòng thử lại sau.", 429);
+  }
+
   const paper = await env.DB.prepare("SELECT paper_id, title, abstract FROM papers WHERE paper_id = ?1")
     .bind(paperId)
     .first();
@@ -157,6 +171,12 @@ async function handleAnalysisRequest(paperId, method, env, ctx) {
   }
   if (!paper.abstract || paper.abstract.trim().length < 20) {
     return errorResponse("abstract_empty", "Bài báo này không có nội dung Abstract để phân tích.", 422);
+  }
+
+  // Kiểm tra & giữ chỗ Ngân sách AI kép (IP/ngày & Toàn hệ thống/ngày)
+  const budgetCheck = await verifyAndConsumeAiBudget(env, clientIp);
+  if (!budgetCheck.allowed) {
+    return errorResponse(budgetCheck.code, budgetCheck.message, 429);
   }
 
   const tAiStart = performance.now();
@@ -181,7 +201,8 @@ async function handleAnalysisRequest(paperId, method, env, ctx) {
     .run();
   const d1WriteMs = (performance.now() - tWrite).toFixed(2);
 
-  ctx.waitUntil(recordDailyUsage(env.DB, { aiCalls: 1, misses: 1, rowsRead: 2, rowsWritten: 1 }));
+  // aiCalls đã được cộng trong verifyAndConsumeAiBudget nên ở đây chỉ cộng misses và rows
+  ctx.waitUntil(recordDailyUsage(env.DB, { aiCalls: 0, misses: 1, rowsRead: 4, rowsWritten: 3 }));
 
   return jsonResponse(
     {
@@ -210,6 +231,8 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
+    const clientIp = getClientIp(request);
+
     try {
       // 1. Health Check
       if (path === "/api/health" && method === "GET") {
@@ -230,8 +253,12 @@ export default {
         );
       }
 
-      // 2. Search API
+      // 2. Search API (Có bảo vệ SEARCH_RATE_LIMITER: 30 req/phút/IP)
       if (path === "/api/search" && method === "GET") {
+        const rl = await checkEdgeRateLimit(env.SEARCH_RATE_LIMITER, `search:${clientIp}`);
+        if (!rl.allowed) {
+          return errorResponse("rate_limited", "Bạn tìm kiếm quá nhanh (tối đa 30 lần/phút). Vui lòng thử lại sau.", 429);
+        }
         const { payload, serverTiming } = await handleSearchRequest(url, env, ctx);
         return jsonResponse(payload, 200, { "Server-Timing": serverTiming });
       }
@@ -249,12 +276,16 @@ export default {
       // 4. AI Analysis API
       const analysisMatch = path.match(/^\/api\/papers\/([^/]+)\/analysis$/);
       if (analysisMatch && (method === "GET" || method === "POST")) {
-        return await handleAnalysisRequest(analysisMatch[1], method, env, ctx);
+        return await handleAnalysisRequest(analysisMatch[1], method, clientIp, env, ctx);
       }
 
-      // 5. Citation Graph API (Gom 1 subrequest + Cache 30 ngày)
+      // 5. Citation Graph API (Có bảo vệ SEARCH_RATE_LIMITER)
       const graphMatch = path.match(/^\/api\/papers\/([^/]+)\/graph$/);
       if (graphMatch && method === "GET") {
+        const rl = await checkEdgeRateLimit(env.SEARCH_RATE_LIMITER, `graph:${clientIp}`);
+        if (!rl.allowed) {
+          return errorResponse("rate_limited", "Bạn gọi tải đồ thị quá nhanh. Vui lòng thử lại sau.", 429);
+        }
         const t0 = performance.now();
         try {
           const result = await getPaperCitationGraph(env, ctx, graphMatch[1]);
@@ -266,7 +297,7 @@ export default {
         }
       }
 
-      // 6. Cite Metadata API (Tối đa 50 mã bài báo)
+      // 6. Cite Metadata API
       if (path === "/api/cite" && method === "GET") {
         const rawIds = (url.searchParams.get("ids") || "").split(",").map((s) => s.trim());
         const validIds = [...new Set(rawIds.filter(isValidPaperId))].slice(0, 50);
@@ -280,7 +311,7 @@ export default {
         return jsonResponse({ count: (rows.results || []).length, items: (rows.results || []).map(formatPaperRow) });
       }
 
-      // 7. Bookmarks API (GET /api/bookmarks, PUT/DELETE /api/bookmarks/:id)
+      // 7. Bookmarks API (GET đọc, PUT/DELETE có bảo vệ AI_RATE_LIMITER chống bơm rác D1)
       if (path === "/api/bookmarks" && method === "GET") {
         const clientId = validateClientId(request);
         if (!clientId) return errorResponse("invalid_client_id", "Thiếu hoặc sai định dạng header X-Client-Id.", 400);
@@ -290,6 +321,10 @@ export default {
 
       const bookmarkMatch = path.match(/^\/api\/bookmarks\/([^/]+)$/);
       if (bookmarkMatch && (method === "PUT" || method === "DELETE")) {
+        const rl = await checkEdgeRateLimit(env.AI_RATE_LIMITER, `bm:${clientIp}`);
+        if (!rl.allowed) {
+          return errorResponse("rate_limited", "Bạn thao tác Bookmark quá nhanh (tối đa 5 lần/phút).", 429);
+        }
         const clientId = validateClientId(request);
         if (!clientId) return errorResponse("invalid_client_id", "Thiếu hoặc sai định dạng header X-Client-Id.", 400);
         const paperId = bookmarkMatch[1];
@@ -313,7 +348,7 @@ export default {
         }
       }
 
-      // 8. Stats API
+      // 8. Stats FinOps API
       if (path === "/api/stats" && method === "GET") {
         const day = getTodayKey();
         const dailyBudget = Number(env.DAILY_AI_BUDGET || 50);
