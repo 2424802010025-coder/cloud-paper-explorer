@@ -1,0 +1,42 @@
+name: Deploy CloudScholar to Cloudflare Edge
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    name: Kiểm tra Cú pháp, Đồng bộ D1 Schema & Triển khai Worker
+    steps:
+      - name: 1. Tải mã nguồn từ nhánh main
+        uses: actions/checkout@v4
+
+      - name: 2. Cài đặt môi trường Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: 3. Cài đặt gói phụ thuộc (Wrangler)
+        run: npm ci
+
+      - name: 4. Kiểm tra đóng gói Worker (Dry-run) & Cú pháp Frontend
+        run: |
+          npx wrangler deploy --dry-run
+          if [ -f public/app.js ]; then node --check public/app.js; fi
+
+      - name: 5. Đồng bộ lược đồ CSDL D1 trên Cloud (Schema Migration)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute paper_explorer_db --remote --file=./schema.sql
+
+      - name: 6. Triển khai Worker & Static Assets lên mạng biên Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
